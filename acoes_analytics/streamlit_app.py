@@ -5,7 +5,8 @@ import plotly.graph_objects as go
 import requests
 from datetime import date, timedelta
 
-API_URL = "http://127.0.0.1:8000"
+import os
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Análise de Ações", layout="wide")
 st.title("Análise Quantitativa de Ações (FastAPI + Streamlit)")
