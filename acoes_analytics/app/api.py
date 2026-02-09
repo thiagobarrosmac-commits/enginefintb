@@ -1,17 +1,19 @@
 from fastapi import FastAPI, HTTPException
 from app.schemas import (
-    AnalysisRequest, ReturnsResponse, SharpeResponse, MarkowitzResponse, CAPMResponse,
-    CorrResponse, RiskResponse
+    AnalysisRequest, ReturnsResponse, SharpeResponse, MarkowitzResponse,
+    CAPMResponse, CorrResponse, RiskResponse
 )
 from app.core import (
     fetch_adj_close, compute_daily_returns, annualize_stats, sharpe_annual,
-    default_benchmark, normalize_weights, portfolio_returns, markowitz_simulation,
-    solve_max_sharpe, solve_min_variance, efficient_envelope,
+    default_benchmark, normalize_weights, portfolio_returns,
+    markowitz_simulation, solve_max_sharpe, solve_min_variance, efficient_envelope,
     capm_portfolio, corr_cov_annual,
     drawdown_series, max_drawdown, rolling_vol, rolling_sharpe
 )
+import numpy as np
+import pandas as pd
 
-app = FastAPI(title="Ações Analytics API", version="1.1.0")
+app = FastAPI(title="Ações Analytics API", version="1.2.0")
 
 @app.get("/")
 def root():
@@ -26,12 +28,14 @@ def returns(req: AnalysisRequest):
     prices = fetch_adj_close(req.tickers, req.start, req.end)
     ret_simple, ret_log = compute_daily_returns(prices)
 
+    annual = annualize_stats(ret_simple, trading_days=req.trading_days, prices=prices)
+
     return {
         "daily_returns": {
             "simple": ret_simple.tail(500).to_dict(),
             "log": ret_log.tail(500).to_dict()
         },
-        "annual_returns": annualize_stats(ret_simple, trading_days=req.trading_days).to_dict()
+        "annual_returns": annual.to_dict()
     }
 
 @app.post("/sharpe", response_model=SharpeResponse)
@@ -40,6 +44,7 @@ def sharpe(req: AnalysisRequest):
     ret_simple, _ = compute_daily_returns(prices)
 
     sharpe_df, stats = sharpe_annual(ret_simple, rf_annual=req.rf_annual, trading_days=req.trading_days)
+
     return {
         "sharpe_annual": sharpe_df.to_dict(),
         "stats_annual": stats.to_dict()
@@ -99,10 +104,9 @@ def markowitz(req: AnalysisRequest):
     w_ms, r_ms, v_ms, s_ms = solve_max_sharpe(mu_a, cov_a, req.rf_annual)
     w_mv, v_mv = solve_min_variance(cov_a)
 
-    # equal weight
     w_eq = normalize_weights(None, len(req.tickers))
     r_eq = float(w_eq @ mu_a)
-    v_eq = float((w_eq @ cov_a @ w_eq) ** 0.5)
+    v_eq = float(np.sqrt(w_eq @ cov_a @ w_eq))
     s_eq = (r_eq - req.rf_annual) / v_eq if v_eq > 0 else None
 
     return {
@@ -148,7 +152,6 @@ def capm(req: AnalysisRequest):
         trading_days=req.trading_days
     )
 
-    # para plot: devolve só os últimos 800 pontos
     capm_tail = capm_df.tail(800)
 
     return {

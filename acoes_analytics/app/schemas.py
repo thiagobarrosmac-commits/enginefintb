@@ -1,5 +1,5 @@
-﻿from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 class AnalysisRequest(BaseModel):
     tickers: List[str] = Field(..., min_length=1, max_length=10)
@@ -21,6 +21,17 @@ class SharpeResponse(BaseModel):
     sharpe_annual: dict
     stats_annual: dict
 
+class CorrResponse(BaseModel):
+    corr: dict
+    cov_annual: dict
+
+class RiskResponse(BaseModel):
+    drawdown: dict
+    max_drawdown: dict
+    rolling_vol_21: dict
+    rolling_vol_63: dict
+    rolling_sharpe_63: dict
+
 class MarkowitzResponse(BaseModel):
     frontier_points: dict
     efficient_envelope: dict
@@ -36,14 +47,3 @@ class CAPMResponse(BaseModel):
     r2: float
     regression: dict
     scatter: dict
-
-class CorrResponse(BaseModel):
-    corr: dict
-    cov_annual: dict
-
-class RiskResponse(BaseModel):
-    drawdown: dict
-    max_drawdown: dict
-    rolling_vol_21: dict
-    rolling_vol_63: dict
-    rolling_sharpe_63: dict
