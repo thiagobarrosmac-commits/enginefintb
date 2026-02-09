@@ -1,15 +1,21 @@
-from pydantic import BaseModel, Field
+﻿from pydantic import BaseModel, Field
 from typing import List, Optional
 
 class AnalysisRequest(BaseModel):
-    tickers: List[str] = Field(..., min_length=1)
+    # ✅ limite de tickers (ajuste como quiser)
+    tickers: List[str] = Field(..., min_length=1, max_length=10)
+
     start: str = Field(..., description="YYYY-MM-DD")
     end: str = Field(..., description="YYYY-MM-DD")
     benchmark: Optional[str] = None
-    rf_annual: float = 0.10
+
+    rf_annual: float = Field(0.10, ge=0.0, le=1.0)
     weights: Optional[List[float]] = None
-    trading_days: int = 252
-    n_portfolios: int = 8000
+
+    trading_days: int = Field(252, ge=200, le=270)
+
+    # ✅ limite de simulação (ajuste)
+    n_portfolios: int = Field(8000, ge=1000, le=20000)
 
 class ReturnsResponse(BaseModel):
     daily_returns: dict

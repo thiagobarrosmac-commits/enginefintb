@@ -8,7 +8,16 @@ from app.core import (
     solve_max_sharpe, solve_min_variance, capm_portfolio
 )
 
-app = FastAPI(title="Ações Analytics API", version="1.0.0")
+app = FastAPI(title="Ações Analytics API", version="1.0.1")
+
+# ✅ para não retornar 404 na raiz
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "acoes-analytics-api"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.post("/returns", response_model=ReturnsResponse)
 def returns(req: AnalysisRequest):
@@ -43,7 +52,7 @@ def markowitz(req: AnalysisRequest):
     prices = fetch_adj_close(req.tickers, req.start, req.end)
     ret_simple, _ = compute_daily_returns(prices)
 
-    df_sim, W, mu_a, cov_a = markowitz_simulation(
+    df_sim, _, mu_a, cov_a = markowitz_simulation(
         ret_simple,
         rf_annual=req.rf_annual,
         n_portfolios=req.n_portfolios,
