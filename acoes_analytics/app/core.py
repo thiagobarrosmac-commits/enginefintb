@@ -129,7 +129,63 @@ def solve_min_variance(cov_a):
     v = float(np.sqrt(w @ cov_a @ w))
     return w, v
 
+# =============================
+# NOVAS FUNÇÕES exigidas pela API v1.1.0
+# =============================
+
+def efficient_envelope(points_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Envelope superior (fronteira eficiente aproximada) a partir de pontos simulados.
+    Mantém pontos que são "recordes" de retorno ao ordenar por volatilidade.
+    Espera colunas: 'vol' e 'ret'.
+    """
+    df = points_df.dropna(subset=["vol", "ret"]).sort_values("vol").copy()
+    max_ret = -np.inf
+    keep = []
+    for _, row in df.iterrows():
+        if row["ret"] >= max_ret:
+            keep.append(True)
+            max_ret = row["ret"]
+        else:
+            keep.append(False)
+    env = df.loc[keep, ["vol", "ret"]].drop_duplicates().sort_values("vol")
+    return env
+
+def corr_cov_annual(daily_returns: pd.DataFrame, trading_days=252):
+    """Retorna (corr, cov_annual) com cov anualizada."""
+    corr = daily_returns.corr()
+    cov_annual = daily_returns.cov() * trading_days
+    return corr, cov_annual
+
+def drawdown_series(returns: pd.Series) -> pd.Series:
+    """Série de drawdown a partir de retornos simples."""
+    cum = (1 + returns).cumprod()
+    peak = cum.cummax()
+    dd = (cum / peak) - 1.0
+    return dd
+
+def max_drawdown(returns: pd.Series) -> float:
+    """Máximo drawdown (valor mínimo da série de drawdown)."""
+    return float(drawdown_series(returns).min())
+
+def rolling_vol(returns: pd.Series, window: int, trading_days=252) -> pd.Series:
+    """Volatilidade rolling anualizada."""
+    return returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
+
+def rolling_sharpe(returns: pd.Series, window: int, rf_annual=0.10, trading_days=252) -> pd.Series:
+    """Sharpe rolling anualizado aproximado usando rf diário."""
+    rf_daily = (1 + rf_annual) ** (1 / trading_days) - 1
+    ex = returns - rf_daily
+    mu = ex.rolling(window).mean() * trading_days
+    vol = returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
+    return mu / vol
+
 def capm_portfolio(port_daily: pd.Series, bench_daily: pd.Series, rf_annual=0.10, trading_days=252):
+    """
+    CAPM (OLS) em excesso de retorno: (Rp - rf) = alpha + beta (Rm - rf)
+    Retorna 5 itens, como sua API espera:
+      alpha_annual, beta, r2, reg_dict, capm_df(x,y,y_hat)
+    """
     df = pd.concat([port_daily, bench_daily], axis=1).dropna()
     df.columns = ["port", "bench"]
 
@@ -153,8 +209,11 @@ def capm_portfolio(port_daily: pd.Series, bench_daily: pd.Series, rf_annual=0.10
 
     alpha_annual = (1 + alpha_daily) ** trading_days - 1
 
-    return float(alpha_annual), float(beta), float(r2), {
+    capm_df = pd.DataFrame({"x": x, "y": y, "y_hat": y_hat}, index=df.index)
+
+    reg = {
         "alpha_daily": float(alpha_daily),
         "rf_daily": float(rf_daily),
         "n_obs": int(len(df))
     }
+    return float(alpha_annual), float(beta), float(r2), reg, capm_df
