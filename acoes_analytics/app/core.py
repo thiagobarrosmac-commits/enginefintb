@@ -2,7 +2,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy import optimize
+from functools import lru_cache
 
+# =============================
+# Defaults / Helpers
+# =============================
 def default_benchmark(tickers):
     if all(t.endswith(".SA") for t in tickers):
         return "^BVSP"
@@ -19,41 +23,115 @@ def normalize_weights(weights, n):
     w = w / w.sum()
     return w
 
-def fetch_adj_close(tickers, start, end):
-    df = yf.download(tickers, start=start, end=end, auto_adjust=False, progress=False)
+# =============================
+# Data fetch (cache)
+# =============================
+@lru_cache(maxsize=64)
+def _fetch_adj_close_cached(tickers_tuple, start, end):
+    tickers = list(tickers_tuple)
+
+    df = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        auto_adjust=False,
+        progress=False,
+        group_by="column",
+        threads=True
+    )
     if df is None or len(df) == 0:
         raise ValueError("Não foi possível baixar dados do yfinance. Verifique tickers/datas.")
 
+    # MultiIndex comum: ('Adj Close', 'JPM'), ('Adj Close', 'MA')...
     if isinstance(df.columns, pd.MultiIndex):
-        if ("Adj Close" in df.columns.get_level_values(0)):
+        if "Adj Close" in df.columns.get_level_values(0):
             px = df["Adj Close"].copy()
-        else:
+        elif "Close" in df.columns.get_level_values(0):
             px = df["Close"].copy()
+        else:
+            raise ValueError("yfinance não retornou 'Adj Close' nem 'Close'.")
     else:
-        px = df[["Adj Close"]].copy() if "Adj Close" in df.columns else df[["Close"]].copy()
-        px.columns = [tickers[0]]
+        # caso 1 ticker
+        if "Adj Close" in df.columns:
+            px = df[["Adj Close"]].copy()
+            px.columns = [tickers[0]]
+        elif "Close" in df.columns:
+            px = df[["Close"]].copy()
+            px.columns = [tickers[0]]
+        else:
+            raise ValueError("yfinance não retornou 'Adj Close' nem 'Close' (single).")
 
+    # limpeza
     px = px.dropna(how="all").ffill().dropna()
+    # remove colunas 100% NaN
+    px = px.dropna(axis=1, how="all")
+
+    if px.shape[1] == 0:
+        raise ValueError("Preços vazios após limpeza (tickers/datas inválidos).")
+
     return px
 
+def fetch_adj_close(tickers, start, end):
+    return _fetch_adj_close_cached(tuple(tickers), start, end).copy()
+
+# =============================
+# 1) Daily returns
+# =============================
 def compute_daily_returns(prices: pd.DataFrame):
+    prices = prices.copy().astype(float)
+    prices = prices.dropna(axis=1, how="all").ffill().dropna()
+
     ret_simple = prices.pct_change().dropna()
     ret_log = np.log(prices / prices.shift(1)).dropna()
     return ret_simple, ret_log
 
+# =============================
+# 2) Annualization
+# =============================
 def annualize_stats(daily_returns: pd.DataFrame, trading_days=252):
-    mu_daily = daily_returns.mean()
-    vol_daily = daily_returns.std(ddof=1)
+    """
+    Robust: remove colunas vazias / infinities para evitar ret_annual virar NaN.
+    """
+    dr = daily_returns.copy()
+
+    # garante numérico e remove colunas que ficaram vazias
+    dr = dr.apply(pd.to_numeric, errors="coerce")
+    dr = dr.replace([np.inf, -np.inf], np.nan)
+    dr = dr.dropna(axis=1, how="all")
+    dr = dr.dropna()
+
+    if dr.empty:
+        # devolve DF vazio com colunas corretas
+        return pd.DataFrame(columns=["ret_annual", "vol_annual"])
+
+    mu_daily = dr.mean()
+    vol_daily = dr.std(ddof=1)
+
+    # retorno anualizado por média diária (simples)
     mu_annual = (1 + mu_daily) ** trading_days - 1
     vol_annual = vol_daily * np.sqrt(trading_days)
+
     out = pd.DataFrame({"ret_annual": mu_annual, "vol_annual": vol_annual})
+    out = out.replace([np.inf, -np.inf], np.nan)
     return out
 
+# =============================
+# 3) Sharpe annual
+# =============================
 def sharpe_annual(daily_returns: pd.DataFrame, rf_annual=0.10, trading_days=252):
     stats = annualize_stats(daily_returns, trading_days=trading_days)
+
+    if stats.empty:
+        sharpe = pd.Series(dtype=float, name="sharpe_annual")
+        return sharpe.to_frame("sharpe_annual"), stats
+
     sharpe = (stats["ret_annual"] - rf_annual) / stats["vol_annual"]
+    sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
     return sharpe.to_frame("sharpe_annual"), stats
 
+# =============================
+# Portfolio returns / stats
+# =============================
 def portfolio_returns(daily_returns: pd.DataFrame, weights):
     w = np.array(weights, dtype=float)
     pr = daily_returns.values @ w
@@ -65,9 +143,18 @@ def portfolio_stats(daily_returns: pd.DataFrame, weights, trading_days=252):
     vol_d = pr.std(ddof=1)
     mu_a = (1 + mu_d) ** trading_days - 1
     vol_a = vol_d * np.sqrt(trading_days)
-    return mu_a, vol_a, pr
+    return float(mu_a), float(vol_a), pr
 
-def markowitz_simulation(daily_returns: pd.DataFrame, rf_annual=0.10, n_portfolios=8000, trading_days=252, seed=42):
+# =============================
+# 4) Markowitz
+# =============================
+def markowitz_simulation(
+    daily_returns: pd.DataFrame,
+    rf_annual=0.10,
+    n_portfolios=8000,
+    trading_days=252,
+    seed=42
+):
     rng = np.random.default_rng(seed)
     n = daily_returns.shape[1]
 
@@ -78,7 +165,7 @@ def markowitz_simulation(daily_returns: pd.DataFrame, rf_annual=0.10, n_portfoli
     cov_a = cov_d * trading_days
 
     Ws, rets, vols, sharpes = [], [], [], []
-    for _ in range(n_portfolios):
+    for _ in range(int(n_portfolios)):
         w = rng.random(n)
         w = w / w.sum()
         r = float(w @ mu_a)
@@ -129,15 +216,10 @@ def solve_min_variance(cov_a):
     v = float(np.sqrt(w @ cov_a @ w))
     return w, v
 
-# =============================
-# NOVAS FUNÇÕES exigidas pela API v1.1.0
-# =============================
-
 def efficient_envelope(points_df: pd.DataFrame) -> pd.DataFrame:
     """
     Envelope superior (fronteira eficiente aproximada) a partir de pontos simulados.
-    Mantém pontos que são "recordes" de retorno ao ordenar por volatilidade.
-    Espera colunas: 'vol' e 'ret'.
+    Mantém recordes de retorno ao ordenar por vol.
     """
     df = points_df.dropna(subset=["vol", "ret"]).sort_values("vol").copy()
     max_ret = -np.inf
@@ -151,46 +233,44 @@ def efficient_envelope(points_df: pd.DataFrame) -> pd.DataFrame:
     env = df.loc[keep, ["vol", "ret"]].drop_duplicates().sort_values("vol")
     return env
 
+# =============================
+# Corr / Cov annual
+# =============================
 def corr_cov_annual(daily_returns: pd.DataFrame, trading_days=252):
-    """Retorna (corr, cov_annual) com cov anualizada."""
     corr = daily_returns.corr()
     cov_annual = daily_returns.cov() * trading_days
     return corr, cov_annual
 
+# =============================
+# Risk extras
+# =============================
 def drawdown_series(returns: pd.Series) -> pd.Series:
-    """Série de drawdown a partir de retornos simples."""
     cum = (1 + returns).cumprod()
     peak = cum.cummax()
     dd = (cum / peak) - 1.0
     return dd
 
 def max_drawdown(returns: pd.Series) -> float:
-    """Máximo drawdown (valor mínimo da série de drawdown)."""
     return float(drawdown_series(returns).min())
 
 def rolling_vol(returns: pd.Series, window: int, trading_days=252) -> pd.Series:
-    """Volatilidade rolling anualizada."""
     return returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
 
 def rolling_sharpe(returns: pd.Series, window: int, rf_annual=0.10, trading_days=252) -> pd.Series:
-    """Sharpe rolling anualizado aproximado usando rf diário."""
     rf_daily = (1 + rf_annual) ** (1 / trading_days) - 1
     ex = returns - rf_daily
     mu = ex.rolling(window).mean() * trading_days
     vol = returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
     return mu / vol
 
+# =============================
+# 5) CAPM (5 retornos: alpha_a, beta, r2, reg_dict, capm_df)
+# =============================
 def capm_portfolio(port_daily: pd.Series, bench_daily: pd.Series, rf_annual=0.10, trading_days=252):
-    """
-    CAPM (OLS) em excesso de retorno: (Rp - rf) = alpha + beta (Rm - rf)
-    Retorna 5 itens, como sua API espera:
-      alpha_annual, beta, r2, reg_dict, capm_df(x,y,y_hat)
-    """
     df = pd.concat([port_daily, bench_daily], axis=1).dropna()
     df.columns = ["port", "bench"]
 
     rf_daily = (1 + rf_annual) ** (1 / trading_days) - 1
-
     y = (df["port"] - rf_daily).values
     x = (df["bench"] - rf_daily).values
 
