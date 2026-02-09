@@ -11,7 +11,7 @@ from datetime import date, timedelta
 # =============================
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-st.set_page_config(page_title="Análise de Ações", layout="wide")
+st.set_page_config(page_title="Análise de Ações TBM", layout="wide")
 st.title("Análise Quantitativa de Ações (FastAPI + Streamlit)")
 st.caption(f"API_URL em uso: {API_URL}")
 
