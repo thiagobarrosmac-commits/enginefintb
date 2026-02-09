@@ -1,16 +1,18 @@
 from fastapi import FastAPI, HTTPException
 from app.schemas import (
-    AnalysisRequest, ReturnsResponse, SharpeResponse, MarkowitzResponse, CAPMResponse
+    AnalysisRequest, ReturnsResponse, SharpeResponse, MarkowitzResponse, CAPMResponse,
+    CorrResponse, RiskResponse
 )
 from app.core import (
     fetch_adj_close, compute_daily_returns, annualize_stats, sharpe_annual,
     default_benchmark, normalize_weights, portfolio_returns, markowitz_simulation,
-    solve_max_sharpe, solve_min_variance, capm_portfolio
+    solve_max_sharpe, solve_min_variance, efficient_envelope,
+    capm_portfolio, corr_cov_annual,
+    drawdown_series, max_drawdown, rolling_vol, rolling_sharpe
 )
 
-app = FastAPI(title="Ações Analytics API", version="1.0.1")
+app = FastAPI(title="Ações Analytics API", version="1.1.0")
 
-# ✅ para não retornar 404 na raiz
 @app.get("/")
 def root():
     return {"status": "ok", "service": "acoes-analytics-api"}
@@ -21,7 +23,6 @@ def health():
 
 @app.post("/returns", response_model=ReturnsResponse)
 def returns(req: AnalysisRequest):
-    _ = req.benchmark or default_benchmark(req.tickers)
     prices = fetch_adj_close(req.tickers, req.start, req.end)
     ret_simple, ret_log = compute_daily_returns(prices)
 
@@ -44,6 +45,40 @@ def sharpe(req: AnalysisRequest):
         "stats_annual": stats.to_dict()
     }
 
+@app.post("/corr", response_model=CorrResponse)
+def corr(req: AnalysisRequest):
+    prices = fetch_adj_close(req.tickers, req.start, req.end)
+    ret_simple, _ = compute_daily_returns(prices)
+    corr_m, cov_a = corr_cov_annual(ret_simple, trading_days=req.trading_days)
+    return {"corr": corr_m.to_dict(), "cov_annual": cov_a.to_dict()}
+
+@app.post("/risk", response_model=RiskResponse)
+def risk(req: AnalysisRequest):
+    prices = fetch_adj_close(req.tickers, req.start, req.end)
+    ret_simple, _ = compute_daily_returns(prices)
+
+    dd = {}
+    mdd = {}
+    rv21 = {}
+    rv63 = {}
+    rs63 = {}
+
+    for c in ret_simple.columns:
+        s = ret_simple[c].dropna()
+        dd[c] = drawdown_series(s).tail(800).to_dict()
+        mdd[c] = max_drawdown(s)
+        rv21[c] = rolling_vol(s, 21, trading_days=req.trading_days).tail(800).to_dict()
+        rv63[c] = rolling_vol(s, 63, trading_days=req.trading_days).tail(800).to_dict()
+        rs63[c] = rolling_sharpe(s, 63, rf_annual=req.rf_annual, trading_days=req.trading_days).tail(800).to_dict()
+
+    return {
+        "drawdown": dd,
+        "max_drawdown": mdd,
+        "rolling_vol_21": rv21,
+        "rolling_vol_63": rv63,
+        "rolling_sharpe_63": rs63
+    }
+
 @app.post("/markowitz", response_model=MarkowitzResponse)
 def markowitz(req: AnalysisRequest):
     if len(req.tickers) < 2:
@@ -52,18 +87,31 @@ def markowitz(req: AnalysisRequest):
     prices = fetch_adj_close(req.tickers, req.start, req.end)
     ret_simple, _ = compute_daily_returns(prices)
 
-    df_sim, _, mu_a, cov_a = markowitz_simulation(
+    pts, _, mu_a, cov_a = markowitz_simulation(
         ret_simple,
         rf_annual=req.rf_annual,
         n_portfolios=req.n_portfolios,
         trading_days=req.trading_days
     )
 
+    env = efficient_envelope(pts)
+
     w_ms, r_ms, v_ms, s_ms = solve_max_sharpe(mu_a, cov_a, req.rf_annual)
     w_mv, v_mv = solve_min_variance(cov_a)
 
+    # equal weight
+    w_eq = normalize_weights(None, len(req.tickers))
+    r_eq = float(w_eq @ mu_a)
+    v_eq = float((w_eq @ cov_a @ w_eq) ** 0.5)
+    s_eq = (r_eq - req.rf_annual) / v_eq if v_eq > 0 else None
+
     return {
-        "frontier_points": df_sim.to_dict(),
+        "frontier_points": pts.to_dict(),
+        "efficient_envelope": env.to_dict(),
+        "equal_weight": {
+            "weights": dict(zip(req.tickers, w_eq.tolist())),
+            "ret": r_eq, "vol": v_eq, "sharpe": s_eq
+        },
         "max_sharpe": {
             "weights": dict(zip(req.tickers, w_ms.tolist())),
             "ret": r_ms, "vol": v_ms, "sharpe": s_ms
@@ -93,17 +141,21 @@ def capm(req: AnalysisRequest):
     w = normalize_weights(req.weights, len(req.tickers))
     port = portfolio_returns(ret_assets, w)
 
-    alpha_a, beta, r2, reg = capm_portfolio(
+    alpha_a, beta, r2, reg, capm_df = capm_portfolio(
         port_daily=port,
         bench_daily=ret_bench.iloc[:, 0],
         rf_annual=req.rf_annual,
         trading_days=req.trading_days
     )
 
+    # para plot: devolve só os últimos 800 pontos
+    capm_tail = capm_df.tail(800)
+
     return {
         "benchmark": bench,
         "alpha_annual": alpha_a,
         "beta": beta,
         "r2": r2,
-        "regression": reg
+        "regression": reg,
+        "scatter": capm_tail.to_dict()
     }
