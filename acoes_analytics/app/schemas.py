@@ -1,10 +1,8 @@
 ﻿from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 class AnalysisRequest(BaseModel):
-    # ✅ limite de tickers (ajuste como quiser)
     tickers: List[str] = Field(..., min_length=1, max_length=10)
-
     start: str = Field(..., description="YYYY-MM-DD")
     end: str = Field(..., description="YYYY-MM-DD")
     benchmark: Optional[str] = None
@@ -13,8 +11,6 @@ class AnalysisRequest(BaseModel):
     weights: Optional[List[float]] = None
 
     trading_days: int = Field(252, ge=200, le=270)
-
-    # ✅ limite de simulação (ajuste)
     n_portfolios: int = Field(8000, ge=1000, le=20000)
 
 class ReturnsResponse(BaseModel):
@@ -27,6 +23,8 @@ class SharpeResponse(BaseModel):
 
 class MarkowitzResponse(BaseModel):
     frontier_points: dict
+    efficient_envelope: dict
+    equal_weight: dict
     max_sharpe: dict
     min_variance: dict
     inputs: dict
@@ -37,3 +35,15 @@ class CAPMResponse(BaseModel):
     beta: float
     r2: float
     regression: dict
+    scatter: dict
+
+class CorrResponse(BaseModel):
+    corr: dict
+    cov_annual: dict
+
+class RiskResponse(BaseModel):
+    drawdown: dict
+    max_drawdown: dict
+    rolling_vol_21: dict
+    rolling_vol_63: dict
+    rolling_sharpe_63: dict

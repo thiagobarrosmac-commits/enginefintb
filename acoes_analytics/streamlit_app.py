@@ -1,287 +1,233 @@
-import os
-import streamlit as st
+import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import requests
-from datetime import date, timedelta
-
-# ✅ pega do env e remove barra final (evita //returns)
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
-
-st.set_page_config(page_title="Análise de Ações", layout="wide")
-st.title("Análise Quantitativa de Ações (FastAPI + Streamlit)")
-
-# Debug útil em produção
-st.caption(f"API_URL em uso: {API_URL}")
+import yfinance as yf
+from scipy import optimize
+from functools import lru_cache
 
 # -----------------------------
-# Inputs
+# Utils
 # -----------------------------
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
-    tickers_raw = st.text_input("Tickers (separados por vírgula)", value="JPM,MA,V")
-with col2:
-    start = st.date_input("Início", value=date.today() - timedelta(days=365 * 5))
-with col3:
-    end = st.date_input("Fim", value=date.today())
+def default_benchmark(tickers):
+    if all(t.endswith(".SA") for t in tickers):
+        return "^BVSP"
+    return "^GSPC"
 
-tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-
-col4, col5, col6 = st.columns([1, 1, 2])
-with col4:
-    rf_annual = st.number_input(
-        "RF anual (ex: 0.10)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.10,
-        step=0.01
-    )
-with col5:
-    # ✅ limite para evitar explosão de CPU no free tier
-    n_portfolios = st.number_input(
-        "N carteiras (Markowitz)",
-        min_value=1000,
-        max_value=20000,
-        value=8000,
-        step=1000
-    )
-with col6:
-    weights_raw = st.text_input("Pesos (opcional, separados por vírgula)", value="")
-
-weights = None
-if weights_raw.strip():
-    try:
-        weights = [float(x.strip()) for x in weights_raw.split(",")]
-    except Exception:
-        st.warning("Pesos inválidos. Use números separados por vírgula (ex: 0.5,0.5).")
-
-payload = {
-    "tickers": tickers,
-    "start": str(start),
-    "end": str(end),
-    "rf_annual": float(rf_annual),
-    "weights": weights,
-    "n_portfolios": int(n_portfolios),
-    "benchmark": None
-}
-
-run = st.button("Rodar análise")
+def normalize_weights(weights, n):
+    if weights is None:
+        return np.ones(n) / n
+    w = np.array(weights, dtype=float)
+    if len(w) != n:
+        raise ValueError("weights deve ter o mesmo tamanho de tickers.")
+    if np.isclose(w.sum(), 0):
+        raise ValueError("weights soma zero.")
+    w = w / w.sum()
+    return w
 
 # -----------------------------
-# Helpers
+# 0) Dados (com cache)
 # -----------------------------
-def call(endpoint: str, payload: dict):
-    url = f"{API_URL}{endpoint}"
-    try:
-        r = requests.post(url, json=payload, timeout=120)
-    except requests.RequestException as e:
-        st.error(f"Falha ao conectar na API: {url}")
-        st.exception(e)
-        raise
+@lru_cache(maxsize=64)
+def _fetch_adj_close_cached(tickers_tuple, start, end):
+    tickers = list(tickers_tuple)
+    df = yf.download(tickers, start=start, end=end, auto_adjust=False, progress=False)
+    if df is None or len(df) == 0:
+        raise ValueError("Não foi possível baixar dados do yfinance. Verifique tickers/datas.")
 
-    if r.status_code != 200:
-        st.error(f"Erro na API ({r.status_code}) em {url}")
-        st.code(r.text)
-        raise RuntimeError(r.text)
-
-    return r.json()
-
-def df_from_dict_index(d: dict) -> pd.DataFrame:
-    """Converte dict -> DataFrame com orientação por índice (tickers no index) quando fizer sentido."""
-    if d is None:
-        return pd.DataFrame()
-    try:
-        return pd.DataFrame.from_dict(d, orient="index")
-    except Exception:
-        # fallback
-        return pd.DataFrame(d)
-
-def normalize_single_metric(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
-    """
-    Garante formato: index=ticker e coluna=metric_name
-    Cobre formatos comuns vindos de pandas .to_dict() em diferentes orientações.
-    """
-    if df is None or df.empty:
-        out = pd.DataFrame(columns=[metric_name])
-        out.index.name = "ticker"
-        return out
-
-    # Caso "bom": já existe a coluna metric_name
-    if metric_name in df.columns:
-        out = df.copy()
-
-    # Caso "invertido": metric_name veio no index (e tickers como colunas)
-    elif metric_name in df.index:
-        out = df.T.copy()
-        # se ficou 1 coluna sem nome ou nomes estranhos, força:
-        if out.shape[1] == 1:
-            out.columns = [metric_name]
-
-    # Caso: veio 1 coluna com nome diferente
-    elif df.shape[1] == 1:
-        out = df.copy()
-        out.columns = [metric_name]
-
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("Adj Close" in df.columns.get_level_values(0)):
+            px = df["Adj Close"].copy()
+        else:
+            px = df["Close"].copy()
     else:
-        # Fallback: tenta transpor
-        out = df.T.copy()
-        if out.shape[1] == 1:
-            out.columns = [metric_name]
+        px = df[["Adj Close"]].copy() if "Adj Close" in df.columns else df[["Close"]].copy()
+        px.columns = [tickers[0]]
 
-    out.index.name = "ticker"
-    return out
+    px = px.dropna(how="all").ffill().dropna()
+    return px
 
-def normalize_stats(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Espera colunas: ret_annual, vol_annual; index: ticker
-    Se vier invertido (essas chaves no index), transpõe.
-    """
-    if df is None or df.empty:
-        out = pd.DataFrame(columns=["ret_annual", "vol_annual"])
-        out.index.name = "ticker"
-        return out
+def fetch_adj_close(tickers, start, end):
+    return _fetch_adj_close_cached(tuple(tickers), start, end).copy()
 
-    if ("ret_annual" in df.index) or ("vol_annual" in df.index):
-        out = df.T.copy()
-    else:
-        out = df.copy()
+# -----------------------------
+# 1) Retorno diário (simples e log)
+# -----------------------------
+def compute_daily_returns(prices: pd.DataFrame):
+    ret_simple = prices.pct_change().dropna()
+    ret_log = np.log(prices / prices.shift(1)).dropna()
+    return ret_simple, ret_log
 
-    out.index.name = "ticker"
+# -----------------------------
+# 2) Retorno anual (anualizado)
+# -----------------------------
+def annualize_stats(daily_returns: pd.DataFrame, trading_days=252):
+    mu_daily = daily_returns.mean()
+    vol_daily = daily_returns.std(ddof=1)
+    mu_annual = (1 + mu_daily) ** trading_days - 1
+    vol_annual = vol_daily * np.sqrt(trading_days)
+    out = pd.DataFrame({"ret_annual": mu_annual, "vol_annual": vol_annual})
     return out
 
 # -----------------------------
-# Run
+# 3) Sharpe (anual)
 # -----------------------------
-if run:
-    if len(tickers) == 0:
-        st.warning("Informe ao menos 1 ticker.")
-        st.stop()
+def sharpe_annual(daily_returns: pd.DataFrame, rf_annual=0.10, trading_days=252):
+    stats = annualize_stats(daily_returns, trading_days=trading_days)
+    sharpe = (stats["ret_annual"] - rf_annual) / stats["vol_annual"]
+    return sharpe.to_frame("sharpe_annual"), stats
 
-    # =============================
-    # 1) Retorno diário + 2) anual
-    # =============================
-    st.subheader("1) Retorno diário + 2) Retorno anual")
-    ret = call("/returns", payload)
+# -----------------------------
+# Carteira: retorno diário do portfólio
+# -----------------------------
+def portfolio_returns(daily_returns: pd.DataFrame, weights):
+    w = np.array(weights, dtype=float)
+    pr = daily_returns.values @ w
+    return pd.Series(pr, index=daily_returns.index, name="portfolio")
 
-    daily_simple = pd.DataFrame(ret["daily_returns"]["simple"])
-    daily_log = pd.DataFrame(ret["daily_returns"]["log"])
+def portfolio_stats(daily_returns: pd.DataFrame, weights, trading_days=252):
+    pr = portfolio_returns(daily_returns, weights)
+    mu_d = pr.mean()
+    vol_d = pr.std(ddof=1)
+    mu_a = (1 + mu_d) ** trading_days - 1
+    vol_a = vol_d * np.sqrt(trading_days)
+    return mu_a, vol_a, pr
 
-    # annual_returns vem como dict; normalizar robustamente
-    raw_annual = pd.DataFrame(ret["annual_returns"])
-    annual = normalize_stats(raw_annual)
+# -----------------------------
+# 4) Markowitz (simulação + ótimos)
+# -----------------------------
+def markowitz_simulation(daily_returns: pd.DataFrame, rf_annual=0.10, n_portfolios=8000, trading_days=252, seed=42):
+    rng = np.random.default_rng(seed)
+    n = daily_returns.shape[1]
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Dataset: Retorno diário (simples)**")
-        st.dataframe(daily_simple.tail(20), use_container_width=True)
+    mu_d = daily_returns.mean().values
+    cov_d = daily_returns.cov().values
 
-        cum = (1 + daily_simple).cumprod()
-        fig = px.line(cum, title="Retorno acumulado (simples)")
-        st.plotly_chart(fig, use_container_width=True)
+    mu_a = (1 + mu_d) ** trading_days - 1
+    cov_a = cov_d * trading_days
 
-    with c2:
-        st.markdown("**Dataset: Retorno diário (log)**")
-        st.dataframe(daily_log.tail(20), use_container_width=True)
+    Ws, rets, vols, sharpes = [], [], [], []
+    for _ in range(n_portfolios):
+        w = rng.random(n)
+        w = w / w.sum()
+        r = float(w @ mu_a)
+        v = float(np.sqrt(w @ cov_a @ w))
+        s = (r - rf_annual) / v if v > 0 else np.nan
+        Ws.append(w)
+        rets.append(r)
+        vols.append(v)
+        sharpes.append(s)
 
-        fig = px.line(daily_log, title="Retorno diário (log)")
-        st.plotly_chart(fig, use_container_width=True)
+    df = pd.DataFrame({"ret": rets, "vol": vols, "sharpe": sharpes})
+    W = np.vstack(Ws)
+    return df, W, mu_a, cov_a
 
-    st.markdown("**Dataset: Estatísticas anualizadas (retorno e volatilidade)**")
-    st.dataframe(annual, use_container_width=True)
+def solve_max_sharpe(mu_a, cov_a, rf_annual):
+    n = len(mu_a)
 
-    # barras em formato "long" (evita .T confuso)
-    if not annual.empty:
-        annual_long = annual.reset_index().melt(id_vars="ticker", var_name="metric", value_name="value")
-        fig = px.bar(
-            annual_long,
-            x="ticker",
-            y="value",
-            color="metric",
-            barmode="group",
-            title="Retorno e Volatilidade anual (por ticker)"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    def neg_sharpe(w):
+        w = np.array(w)
+        r = w @ mu_a
+        v = np.sqrt(w @ cov_a @ w)
+        return -((r - rf_annual) / v)
 
-    # =============================
-    # 3) Sharpe
-    # =============================
-    st.divider()
-    st.subheader("3) Sharpe")
+    cons = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0},)
+    bounds = [(0.0, 1.0)] * n
+    x0 = np.ones(n) / n
 
-    sh = call("/sharpe", payload)
+    res = optimize.minimize(neg_sharpe, x0=x0, bounds=bounds, constraints=cons, method="SLSQP")
+    w = res.x
+    r = float(w @ mu_a)
+    v = float(np.sqrt(w @ cov_a @ w))
+    s = (r - rf_annual) / v if v > 0 else np.nan
+    return w, r, v, s
 
-    # sharpe_annual e stats_annual podem vir em orientações diferentes
-    raw_sharpe = pd.DataFrame(sh["sharpe_annual"])
-    raw_stats = pd.DataFrame(sh["stats_annual"])
+def solve_min_variance(cov_a):
+    n = cov_a.shape[0]
 
-    sharpe_df = normalize_single_metric(raw_sharpe, "sharpe_annual")
-    stats_df = normalize_stats(raw_stats)
+    def port_var(w):
+        w = np.array(w)
+        return w @ cov_a @ w
 
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("**Dataset: Sharpe anual**")
-        st.dataframe(sharpe_df, use_container_width=True)
+    cons = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0},)
+    bounds = [(0.0, 1.0)] * n
+    x0 = np.ones(n) / n
 
-        if (not sharpe_df.empty) and ("sharpe_annual" in sharpe_df.columns):
-            fig = px.bar(
-                sharpe_df.reset_index(),
-                x="ticker",
-                y="sharpe_annual",
-                title="Sharpe anual"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    res = optimize.minimize(port_var, x0=x0, bounds=bounds, constraints=cons, method="SLSQP")
+    w = res.x
+    v = float(np.sqrt(w @ cov_a @ w))
+    return w, v
+
+def efficient_envelope(points_df: pd.DataFrame) -> pd.DataFrame:
+    """Envelope superior (fronteira eficiente aproximada) a partir de pontos simulados."""
+    df = points_df.dropna(subset=["vol", "ret"]).sort_values("vol").copy()
+    max_ret = -np.inf
+    keep = []
+    for _, row in df.iterrows():
+        if row["ret"] >= max_ret:
+            keep.append(True)
+            max_ret = row["ret"]
         else:
-            st.info("Sharpe retornou vazio ou sem coluna esperada.")
+            keep.append(False)
+    env = df.loc[keep, ["vol", "ret"]].drop_duplicates().sort_values("vol")
+    return env
 
-    with c4:
-        st.markdown("**Dataset: Stats anual (ret/vol)**")
-        st.dataframe(stats_df, use_container_width=True)
+# -----------------------------
+# 5) CAPM do portfólio vs benchmark
+# -----------------------------
+def capm_portfolio(port_daily: pd.Series, bench_daily: pd.Series, rf_annual=0.10, trading_days=252):
+    df = pd.concat([port_daily, bench_daily], axis=1).dropna()
+    df.columns = ["port", "bench"]
 
-        if (
-            (not stats_df.empty)
-            and ("vol_annual" in stats_df.columns)
-            and ("ret_annual" in stats_df.columns)
-        ):
-            fig = px.scatter(
-                stats_df.reset_index(),
-                x="vol_annual",
-                y="ret_annual",
-                title="Risco x Retorno (anual)",
-                text="ticker"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Stats anual sem colunas esperadas (ret_annual / vol_annual).")
+    rf_daily = (1 + rf_annual) ** (1 / trading_days) - 1
+    y = (df["port"] - rf_daily).values
+    x = (df["bench"] - rf_daily).values
 
-    # =============================
-    # 4) Markowitz
-    # =============================
-    st.divider()
-    st.subheader("4) Markowitz")
+    x_mean = x.mean()
+    y_mean = y.mean()
+    cov_xy = np.mean((x - x_mean) * (y - y_mean))
+    var_x = np.mean((x - x_mean) ** 2)
 
-    if len(tickers) < 2:
-        st.info("Markowitz requer 2+ tickers. Pulei este módulo.")
-    else:
-        mk = call("/markowitz", payload)
-        pts = pd.DataFrame(mk["frontier_points"])
+    beta = cov_xy / var_x if var_x > 0 else np.nan
+    alpha_daily = y_mean - beta * x_mean
 
-        max_sh = mk["max_sharpe"]
-        min_v = mk["min_variance"]
+    y_hat = alpha_daily + beta * x
+    ss_res = np.sum((y - y_hat) ** 2)
+    ss_tot = np.sum((y - y_mean) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-        c5, c6 = st.columns([2, 1])
-        with c5:
-            fig = px.scatter(
-                pts,
-                x="vol",
-                y="ret",
-                title="Simulação Markowitz (vol x ret)",
-                hover_data=["sharpe"]
-            )
-            fig.add_trace(go.Scatter(
-                x=[max_sh["vol"]],
-                y=[max_sh["ret"]],
-                mode="markers",
-                name="Max Sharpe"
-            ))
-            # pon
+    alpha_annual = (1 + alpha_daily) ** trading_days - 1
+
+    # devolver séries para plot
+    capm_df = pd.DataFrame({"x": x, "y": y, "y_hat": y_hat}, index=df.index)
+
+    return float(alpha_annual), float(beta), float(r2), {
+        "alpha_daily": float(alpha_daily),
+        "rf_daily": float(rf_daily),
+        "n_obs": int(len(df))
+    }, capm_df
+
+# -----------------------------
+# Risco adicional: drawdown, rolling
+# -----------------------------
+def drawdown_series(returns: pd.Series) -> pd.Series:
+    cum = (1 + returns).cumprod()
+    peak = cum.cummax()
+    dd = (cum / peak) - 1.0
+    return dd
+
+def max_drawdown(returns: pd.Series) -> float:
+    return float(drawdown_series(returns).min())
+
+def rolling_vol(returns: pd.Series, window: int, trading_days=252) -> pd.Series:
+    return returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
+
+def rolling_sharpe(returns: pd.Series, window: int, rf_annual=0.10, trading_days=252) -> pd.Series:
+    rf_daily = (1 + rf_annual) ** (1 / trading_days) - 1
+    ex = returns - rf_daily
+    mu = ex.rolling(window).mean() * trading_days
+    vol = returns.rolling(window).std(ddof=1) * np.sqrt(trading_days)
+    return mu / vol
+
+def corr_cov_annual(daily_returns: pd.DataFrame, trading_days=252):
+    corr = daily_returns.corr()
+    cov_annual = daily_returns.cov() * trading_days
+    return corr, cov_annual
