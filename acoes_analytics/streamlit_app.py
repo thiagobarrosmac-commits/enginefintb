@@ -11,7 +11,7 @@ from datetime import date, timedelta
 # =============================
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-st.set_page_config(page_title="Análise de Ações TBM", layout="wide")
+st.set_page_config(page_title="Análise de Ações", layout="wide")
 st.title("Análise Quantitativa de Ações (FastAPI + Streamlit)")
 st.caption(f"API_URL em uso: {API_URL}")
 
@@ -34,12 +34,16 @@ def call(endpoint: str, payload: dict):
 
     return r.json()
 
-def to_df_indexed(d: dict, index_name="ticker") -> pd.DataFrame:
-    """Converte dict->DataFrame assumindo tickers no index (orient=index)."""
-    if d is None:
+def to_df_cols(d: dict, index_name="ticker") -> pd.DataFrame:
+    """
+    Reconstrói DataFrame a partir do pandas .to_dict() padrão:
+    {coluna: {index: valor}}  => orient='columns'
+    """
+    if not d:
         out = pd.DataFrame()
-    else:
-        out = pd.DataFrame.from_dict(d, orient="index")
+        out.index.name = index_name
+        return out
+    out = pd.DataFrame.from_dict(d, orient="columns")
     out.index.name = index_name
     return out
 
@@ -124,13 +128,13 @@ if run:
     daily_simple = pd.DataFrame(ret["daily_returns"]["simple"])
     daily_log = pd.DataFrame(ret["daily_returns"]["log"])
 
-    # ✅ Correção definitiva: annual_returns orient=index
-    annual = to_df_indexed(ret["annual_returns"], index_name="ticker")
+    # ✅ agora correto com o .to_dict() padrão do backend
+    annual = to_df_cols(ret["annual_returns"], index_name="ticker")
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Dataset: Retorno diário (simples)**")
-        st.dataframe(daily_simple.tail(20), use_container_width=True)
+        st.dataframe(daily_simple.tail(20), use_container_width=True, height=240)
 
         cum = (1 + daily_simple).cumprod()
         fig = px.line(cum, title="Retorno acumulado (simples)")
@@ -138,13 +142,13 @@ if run:
 
     with c2:
         st.markdown("**Dataset: Retorno diário (log)**")
-        st.dataframe(daily_log.tail(20), use_container_width=True)
+        st.dataframe(daily_log.tail(20), use_container_width=True, height=240)
 
         fig = px.line(daily_log, title="Retorno diário (log)")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("**Dataset: Estatísticas anualizadas (retorno e volatilidade)**")
-    st.dataframe(annual, use_container_width=True)
+    st.dataframe(annual, use_container_width=True, height=220)
 
     if not annual.empty:
         annual_long = annual.reset_index().melt(id_vars="ticker", var_name="metric", value_name="value")
@@ -163,32 +167,25 @@ if run:
     # -----------------------------
     st.divider()
     st.subheader("3) Sharpe")
-
     sh = call("/sharpe", payload)
 
-    # ✅ Correção definitiva: sharpe e stats orient=index
-    sharpe_df = to_df_indexed(sh["sharpe_annual"], index_name="ticker")
-    stats_df = to_df_indexed(sh["stats_annual"], index_name="ticker")
+    sharpe_df = to_df_cols(sh["sharpe_annual"], index_name="ticker")
+    stats_df = to_df_cols(sh["stats_annual"], index_name="ticker")
 
     c3, c4 = st.columns(2)
     with c3:
         st.markdown("**Dataset: Sharpe anual**")
-        st.dataframe(sharpe_df, use_container_width=True)
+        st.dataframe(sharpe_df, use_container_width=True, height=240)
 
         if "sharpe_annual" in sharpe_df.columns and not sharpe_df.empty:
-            fig = px.bar(
-                sharpe_df.reset_index(),
-                x="ticker",
-                y="sharpe_annual",
-                title="Sharpe anual"
-            )
+            fig = px.bar(sharpe_df.reset_index(), x="ticker", y="sharpe_annual", title="Sharpe anual")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Sharpe vazio/sem coluna esperada.")
 
     with c4:
         st.markdown("**Dataset: Stats anual (ret/vol)**")
-        st.dataframe(stats_df, use_container_width=True)
+        st.dataframe(stats_df, use_container_width=True, height=240)
 
         if {"ret_annual", "vol_annual"}.issubset(stats_df.columns) and not stats_df.empty:
             fig = px.scatter(
@@ -209,20 +206,20 @@ if run:
     st.subheader("Matriz de Correlação e Covariância Anualizada")
 
     cc = call("/corr", payload)
-    corr = to_df_indexed(cc["corr"], index_name="ticker")
-    cov_a = to_df_indexed(cc["cov_annual"], index_name="ticker")
+    corr = to_df_cols(cc["corr"], index_name="ticker")
+    cov_a = to_df_cols(cc["cov_annual"], index_name="ticker")
 
     cA, cB = st.columns(2)
     with cA:
         st.markdown("**Correlação**")
-        st.dataframe(corr, use_container_width=True)
+        st.dataframe(corr, use_container_width=True, height=260)
         if not corr.empty:
             fig = px.imshow(corr, title="Heatmap de Correlação", aspect="auto")
             st.plotly_chart(fig, use_container_width=True)
 
     with cB:
         st.markdown("**Covariância anualizada**")
-        st.dataframe(cov_a, use_container_width=True)
+        st.dataframe(cov_a, use_container_width=True, height=260)
         if not cov_a.empty:
             fig = px.imshow(cov_a, title="Heatmap de Covariância Anualizada", aspect="auto")
             st.plotly_chart(fig, use_container_width=True)
@@ -287,7 +284,7 @@ if run:
         st.info("Sem dados de sharpe rolling 63d.")
 
     # -----------------------------
-    # 4) Markowitz (com envelope + equal-weight)
+    # 4) Markowitz
     # -----------------------------
     st.divider()
     st.subheader("4) Markowitz")
@@ -313,7 +310,6 @@ if run:
                 hover_data=["sharpe"]
             )
 
-            # envelope (linha)
             if not env.empty and {"vol", "ret"}.issubset(env.columns):
                 fig.add_trace(go.Scatter(
                     x=env["vol"], y=env["ret"],
@@ -321,7 +317,6 @@ if run:
                     name="Envelope (Fronteira aprox.)"
                 ))
 
-            # equal-weight
             if "vol" in eq and "ret" in eq:
                 fig.add_trace(go.Scatter(
                     x=[eq["vol"]], y=[eq["ret"]],
@@ -329,13 +324,16 @@ if run:
                     name="Equal Weight"
                 ))
 
-            # max sharpe
             if "vol" in max_sh and "ret" in max_sh:
                 fig.add_trace(go.Scatter(
                     x=[max_sh["vol"]], y=[max_sh["ret"]],
                     mode="markers",
                     name="Max Sharpe"
                 ))
+
+            # (opcional) marcar min variância se quiser:
+            # if "vol" in min_v:
+            #     fig.add_trace(go.Scatter(x=[min_v["vol"]], y=[None], mode="markers", name="Min Variância"))
 
             st.plotly_chart(fig, use_container_width=True)
 
@@ -355,7 +353,6 @@ if run:
 
     capm = call("/capm", payload)
 
-    # mostra resumo
     st.json({
         "benchmark": capm.get("benchmark"),
         "alpha_annual": capm.get("alpha_annual"),
@@ -364,7 +361,8 @@ if run:
         "regression": capm.get("regression")
     })
 
-    sc = pd.DataFrame.from_dict(capm.get("scatter", {}), orient="index")
+    # ✅ scatter vem de capm_df.to_dict() padrão => orient="columns"
+    sc = pd.DataFrame.from_dict(capm.get("scatter", {}), orient="columns")
     if not sc.empty:
         try:
             sc.index = pd.to_datetime(sc.index)
@@ -372,9 +370,8 @@ if run:
             pass
         sc = sc.sort_index()
 
-        # scatter x vs y e linha ajustada
-        fig = go.Figure()
         if {"x", "y", "y_hat"}.issubset(sc.columns):
+            fig = go.Figure()
             fig.add_trace(go.Scatter(x=sc["x"], y=sc["y"], mode="markers", name="Excess Return (obs)"))
             fig.add_trace(go.Scatter(x=sc["x"], y=sc["y_hat"], mode="lines", name="Linha CAPM (ajuste)"))
             fig.update_layout(
