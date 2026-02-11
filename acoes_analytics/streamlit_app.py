@@ -188,6 +188,9 @@ if run:
 
     annual_p = pd.concat([annual, port_row], axis=0)
 
+    # ✅ FIX: garante nome do index para o reset_index criar coluna "ticker"
+    annual_p.index.name = "ticker"
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Dataset: Retorno diário (simples)**")
@@ -203,9 +206,16 @@ if run:
 
     show_table(annual_p, "Estatísticas anualizadas (tickers + PORT)")
 
+    # ✅ FIX: melt robusto (mesmo se por algum motivo a coluna não vier como 'ticker')
     if not annual_p.empty:
-        annual_long = annual_p.reset_index().melt(id_vars="ticker", var_name="metric", value_name="value")
-        # Melhor UX: separar vol_annual do resto pode ser feito depois; por ora mantém.
+        annual_plot = annual_p.copy()
+        annual_plot.index.name = "ticker"
+        annual_plot = annual_plot.reset_index()
+        if "ticker" not in annual_plot.columns:
+            annual_plot = annual_plot.rename(columns={annual_plot.columns[0]: "ticker"})
+
+        annual_long = annual_plot.melt(id_vars="ticker", var_name="metric", value_name="value")
+
         st.plotly_chart(
             px.bar(
                 annual_long,
@@ -299,7 +309,6 @@ if run:
         st.plotly_chart(px.line(dd, title="Drawdown por Ativo (inclui PORT)"), use_container_width=True)
 
     mdd = pd.Series(rk.get("max_drawdown", {})).sort_values()
-    # max drawdown PORT local
     mdd.loc["PORT"] = float(dd["PORT"].min()) if "PORT" in dd.columns else np.nan
     mdd = mdd.sort_values()
 
@@ -343,7 +352,6 @@ if run:
         if "vol" in max_sh and "ret" in max_sh:
             fig.add_trace(go.Scatter(x=[max_sh["vol"]], y=[max_sh["ret"]], mode="markers", name="Max Sharpe"))
 
-        # PORT point from local weights
         p_ret = float(port_stats["ret_annual"])
         p_vol = float(port_stats["vol_annual"])
         fig.add_trace(go.Scatter(x=[p_vol], y=[p_ret], mode="markers", name="PORT (seus pesos)"))
