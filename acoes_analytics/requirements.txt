@@ -8,3 +8,4 @@ scipy
 plotly
 requests
 pydantic
+openpyxl>=3.1.2
