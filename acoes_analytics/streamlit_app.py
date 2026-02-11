@@ -1,4 +1,5 @@
 import os
+import io
 import numpy as np
 import streamlit as st
 import pandas as pd
@@ -14,7 +15,7 @@ st.title("Análise Quantitativa de Ações (FastAPI + Streamlit)")
 st.caption(f"API_URL em uso: {API_URL}")
 
 # -----------------------------
-# Helpers
+# API + Data helpers
 # -----------------------------
 def call(endpoint: str, payload: dict):
     url = f"{API_URL}{endpoint}"
@@ -46,7 +47,7 @@ def series_dict_to_df(d: dict) -> pd.DataFrame:
         pass
     return df.sort_index()
 
-def show_table(df: pd.DataFrame, title: str, fmt: str = "{:.4f}"):
+def show_table(df: pd.DataFrame, title: str, fmt: str = "{:.6f}"):
     st.markdown(f"**{title}**")
     if df is None or df.empty:
         st.info("Sem dados.")
@@ -55,6 +56,31 @@ def show_table(df: pd.DataFrame, title: str, fmt: str = "{:.4f}"):
     for c in df2.columns:
         df2[c] = pd.to_numeric(df2[c], errors="coerce")
     st.table(df2.style.format(fmt))
+
+def download_df(df: pd.DataFrame, filename_base: str):
+    """Botões CSV + XLSX para Excel."""
+    if df is None or df.empty:
+        return
+
+    # CSV
+    csv_bytes = df.to_csv(index=True).encode("utf-8")
+    st.download_button(
+        label=f"⬇️ Baixar {filename_base}.csv",
+        data=csv_bytes,
+        file_name=f"{filename_base}.csv",
+        mime="text/csv",
+    )
+
+    # XLSX
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="data", index=True)
+    st.download_button(
+        label=f"⬇️ Baixar {filename_base}.xlsx",
+        data=output.getvalue(),
+        file_name=f"{filename_base}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # -----------------------------
 # Portfolio helpers (local)
@@ -110,7 +136,7 @@ def portfolio_rolling_sharpe(port_simple: pd.Series, window: int, rf_annual=0.10
 # -----------------------------
 col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
-    tickers_raw = st.text_input("Tickers (separados por vírgula)", value="JPM,MA,V")
+    tickers_raw = st.text_input("Tickers (separados por vírgula)", value="JPM,MA,V,GOOG")
 with col2:
     start = st.date_input("Início", value=date.today() - timedelta(days=365 * 5))
 with col3:
@@ -134,17 +160,41 @@ if weights_raw.strip():
         st.warning("Pesos inválidos. Use números separados por vírgula (ex: 0.5,0.5).")
         weights = None
 
-payload = {
+st.divider()
+st.subheader("CAPM: Benchmark")
+bcol1, bcol2, bcol3 = st.columns([1.2, 1.2, 1.6])
+
+with bcol1:
+    benchmark_main = st.selectbox(
+        "Benchmark principal (CAPM)",
+        ["Auto", "^GSPC", "^NYA", "^DJI", "^IXIC", "SPY"],
+        index=0
+    )
+
+with bcol2:
+    compare_two = st.checkbox("Comparar com 2 benchmarks", value=True)
+
+with bcol3:
+    benchmark_2 = st.selectbox(
+        "Benchmark 2 (se comparar)",
+        ["^NYA", "^GSPC", "^DJI", "^IXIC", "SPY"],
+        index=0
+    )
+
+run = st.button("Rodar análise")
+
+def bench_value(sel: str):
+    return None if sel == "Auto" else sel
+
+payload_base = {
     "tickers": tickers,
     "start": str(start),
     "end": str(end),
     "rf_annual": float(rf_annual),
     "weights": weights,
     "n_portfolios": int(n_portfolios),
-    "benchmark": None
+    "benchmark": bench_value(benchmark_main),
 }
-
-run = st.button("Rodar análise")
 
 # -----------------------------
 # Run
@@ -154,17 +204,20 @@ if run:
         st.warning("Informe ao menos 1 ticker.")
         st.stop()
 
+    # -----------------------------
     # 1) Returns
+    # -----------------------------
     st.subheader("1) Retorno diário + 2) Retorno anual")
-    ret = call("/returns", payload)
+    ret = call("/returns", payload_base)
 
     daily_simple = pd.DataFrame(ret["daily_returns"]["simple"])
     daily_log = pd.DataFrame(ret["daily_returns"]["log"])
 
-    # --- portfolio series (PORT) ---
+    # Portfolio series (PORT)
     try:
         port_simple = portfolio_simple_returns(daily_simple, weights)
         port_log = portfolio_log_returns_from_simple(port_simple)
+        w_port = normalize_weights_local(weights, len(tickers))
     except Exception as e:
         st.error("Erro ao calcular PORTFÓLIO com os pesos informados.")
         st.exception(e)
@@ -178,7 +231,7 @@ if run:
 
     annual = to_df_cols(ret["annual_returns"], index_name="ticker")
 
-    # stats PORT (anual) para tabelas/pontos
+    # PORT anual (para tabelas/pontos)
     port_stats = annual_stats_from_simple(port_simple, trading_days=252)
     port_row = pd.DataFrame([{
         "ret_annual": port_stats["ret_annual"],
@@ -187,15 +240,12 @@ if run:
     }], index=["PORT"])
 
     annual_p = pd.concat([annual, port_row], axis=0)
-
-    # ✅ FIX: garante nome do index para o reset_index criar coluna "ticker"
     annual_p.index.name = "ticker"
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Dataset: Retorno diário (simples)**")
         st.dataframe(daily_simple_p.tail(20), use_container_width=True, height=240)
-
         cum = (1 + daily_simple_p).cumprod()
         st.plotly_chart(px.line(cum, title="Retorno acumulado (simples) + PORT"), use_container_width=True)
 
@@ -204,16 +254,15 @@ if run:
         st.dataframe(daily_log_p.tail(20), use_container_width=True, height=240)
         st.plotly_chart(px.line(daily_log_p, title="Retorno diário (log) + PORT"), use_container_width=True)
 
-    show_table(annual_p, "Estatísticas anualizadas (tickers + PORT)")
+    show_table(annual_p, "Estatísticas anualizadas (tickers + PORT)", fmt="{:.6f}")
 
-    # ✅ FIX: melt robusto (mesmo se por algum motivo a coluna não vier como 'ticker')
+    # Gráfico anual (melt robusto)
     if not annual_p.empty:
         annual_plot = annual_p.copy()
         annual_plot.index.name = "ticker"
         annual_plot = annual_plot.reset_index()
         if "ticker" not in annual_plot.columns:
             annual_plot = annual_plot.rename(columns={annual_plot.columns[0]: "ticker"})
-
         annual_long = annual_plot.melt(id_vars="ticker", var_name="metric", value_name="value")
 
         st.plotly_chart(
@@ -223,20 +272,22 @@ if run:
                 y="value",
                 color="metric",
                 barmode="group",
-                title="Retorno/Vol/CAGR anual (por ticker) + PORT (ret/vol)"
+                title="Retorno/Vol/CAGR anual (por ticker) + PORT"
             ),
             use_container_width=True
         )
 
+    # -----------------------------
     # 3) Sharpe
+    # -----------------------------
     st.divider()
     st.subheader("3) Sharpe")
-    sh = call("/sharpe", payload)
+    sh = call("/sharpe", payload_base)
 
     sharpe_df = to_df_cols(sh["sharpe_annual"], index_name="ticker")
     stats_df = to_df_cols(sh["stats_annual"], index_name="ticker")
 
-    # append PORT into stats and sharpe
+    # Append PORT
     stats_df_p = stats_df.copy()
     stats_df_p.loc["PORT", "ret_annual"] = port_stats["ret_annual"]
     stats_df_p.loc["PORT", "vol_annual"] = port_stats["vol_annual"]
@@ -247,7 +298,7 @@ if run:
 
     c3, c4 = st.columns(2)
     with c3:
-        show_table(sharpe_df_p, "Sharpe anual (tickers + PORT)")
+        show_table(sharpe_df_p, "Sharpe anual (tickers + PORT)", fmt="{:.6f}")
         if "sharpe_annual" in sharpe_df_p.columns and not sharpe_df_p.empty:
             st.plotly_chart(
                 px.bar(sharpe_df_p.reset_index(), x="ticker", y="sharpe_annual", title="Sharpe anual (inclui PORT)"),
@@ -255,7 +306,7 @@ if run:
             )
 
     with c4:
-        show_table(stats_df_p, "Stats anual (ret/vol) (tickers + PORT)")
+        show_table(stats_df_p, "Stats anual (ret/vol) (tickers + PORT)", fmt="{:.6f}")
         if {"ret_annual", "vol_annual"}.issubset(stats_df_p.columns) and not stats_df_p.empty:
             st.plotly_chart(
                 px.scatter(
@@ -268,10 +319,12 @@ if run:
                 use_container_width=True
             )
 
+    # -----------------------------
     # Corr / Cov
+    # -----------------------------
     st.divider()
     st.subheader("Matriz de Correlação e Covariância Anualizada")
-    cc = call("/corr", payload)
+    cc = call("/corr", payload_base)
     corr = to_df_cols(cc["corr"], index_name="ticker")
     cov_a = to_df_cols(cc["cov_annual"], index_name="ticker")
 
@@ -288,17 +341,18 @@ if run:
             st.plotly_chart(px.imshow(cov_a, title="Heatmap de Covariância Anualizada", aspect="auto"),
                             use_container_width=True)
 
+    # -----------------------------
     # Risk (API) + PORT (local)
+    # -----------------------------
     st.divider()
     st.subheader("Risco: Drawdown e Métricas Rolling (inclui PORT)")
-    rk = call("/risk", payload)
+    rk = call("/risk", payload_base)
 
     dd = series_dict_to_df(rk.get("drawdown", {}))
     rv21 = series_dict_to_df(rk.get("rolling_vol_21", {}))
     rv63 = series_dict_to_df(rk.get("rolling_vol_63", {}))
     rs63 = series_dict_to_df(rk.get("rolling_sharpe_63", {}))
 
-    # add PORT series locally
     dd["PORT"] = portfolio_drawdown_from_simple(port_simple)
     rv21["PORT"] = portfolio_rolling_vol(port_simple, 21, trading_days=252)
     rv63["PORT"] = portfolio_rolling_vol(port_simple, 63, trading_days=252)
@@ -314,7 +368,7 @@ if run:
 
     st.markdown("**Max Drawdown**")
     if not mdd.empty:
-        st.table(mdd.to_frame("max_drawdown").style.format("{:.4f}"))
+        st.table(mdd.to_frame("max_drawdown").style.format("{:.6f}"))
 
     cR1, cR2 = st.columns(2)
     with cR1:
@@ -330,13 +384,16 @@ if run:
     if not rs63.empty:
         st.plotly_chart(px.line(rs63, title="Sharpe Rolling 63d (inclui PORT)"), use_container_width=True)
 
-    # Markowitz
+    # -----------------------------
+    # 4) Markowitz (inclui ponto PORT)
+    # -----------------------------
     st.divider()
     st.subheader("4) Markowitz (inclui ponto PORT)")
+
     if len(tickers) < 2:
         st.info("Markowitz requer 2+ tickers. Pulei este módulo.")
     else:
-        mk = call("/markowitz", payload)
+        mk = call("/markowitz", payload_base)
 
         pts = pd.DataFrame(mk["frontier_points"])
         env = pd.DataFrame(mk.get("efficient_envelope", {}))
@@ -357,23 +414,86 @@ if run:
         fig.add_trace(go.Scatter(x=[p_vol], y=[p_ret], mode="markers", name="PORT (seus pesos)"))
 
         st.plotly_chart(fig, use_container_width=True)
-        st.json({"equal_weight": eq, "max_sharpe": max_sh, "min_variance": min_v, "port": {"ret": p_ret, "vol": p_vol}})
 
-    # CAPM (já é do portfólio via backend)
+        # -----------------------------
+        # MARKOWITZ -> TABELAS (Excel-friendly)
+        # -----------------------------
+        def weights_row(dct, tickers_list):
+            w = (dct or {}).get("weights", {}) if isinstance(dct, dict) else {}
+            return {t: float(w.get(t, 0.0)) for t in tickers_list}
+
+        markowitz_metrics = pd.DataFrame(
+            [
+                {"strategy": "equal_weight", "ret": eq.get("ret"), "vol": eq.get("vol"), "sharpe": eq.get("sharpe")},
+                {"strategy": "max_sharpe", "ret": max_sh.get("ret"), "vol": max_sh.get("vol"), "sharpe": max_sh.get("sharpe")},
+                {"strategy": "min_variance", "ret": np.nan, "vol": min_v.get("vol"), "sharpe": np.nan},
+                {"strategy": "port_user", "ret": p_ret, "vol": p_vol, "sharpe": sharpe_from_annual(p_ret, p_vol, rf_annual=rf_annual)},
+            ]
+        ).set_index("strategy")
+
+        markowitz_weights = pd.DataFrame(
+            {
+                "equal_weight": weights_row(eq, tickers),
+                "max_sharpe": weights_row(max_sh, tickers),
+                "min_variance": weights_row(min_v, tickers),
+                "port_user": {t: float(w_port[i]) for i, t in enumerate(tickers)},
+            }
+        ).T
+        markowitz_weights.index.name = "strategy"
+        markowitz_weights["sum_weights"] = markowitz_weights.sum(axis=1)
+
+        st.markdown("### Markowitz — Resumo (ret/vol/sharpe)")
+        st.dataframe(markowitz_metrics.round(6), use_container_width=True)
+        download_df(markowitz_metrics.round(6), "markowitz_metrics")
+
+        st.markdown("### Markowitz — Pesos (por estratégia)")
+        st.dataframe(markowitz_weights.round(6), use_container_width=True)
+        download_df(markowitz_weights.round(6), "markowitz_weights")
+
+    # -----------------------------
+    # 5) CAPM do Portfólio (alpha, beta, R²) -> TABELAS
+    # -----------------------------
     st.divider()
     st.subheader("5) CAPM do Portfólio (alpha, beta, R²)")
-    capm = call("/capm", payload)
 
-    st.json({
-        "benchmark": capm.get("benchmark"),
-        "alpha_annual": capm.get("alpha_annual"),
-        "beta": capm.get("beta"),
-        "r2": capm.get("r2"),
-        "regression": capm.get("regression"),
-        "portfolio": "PORT (pesos do usuário)"
-    })
+    def capm_call(bench):
+        p = dict(payload_base)
+        p["benchmark"] = bench
+        return call("/capm", p)
 
-    sc = pd.DataFrame.from_dict(capm.get("scatter", {}), orient="columns")
+    capm1 = capm_call(payload_base["benchmark"])  # pode ser None (Auto)
+    rows = [{
+        "benchmark": capm1.get("benchmark"),
+        "alpha_annual": capm1.get("alpha_annual"),
+        "beta": capm1.get("beta"),
+        "r2": capm1.get("r2"),
+        "alpha_daily": (capm1.get("regression") or {}).get("alpha_daily"),
+        "rf_daily": (capm1.get("regression") or {}).get("rf_daily"),
+        "n_obs": (capm1.get("regression") or {}).get("n_obs"),
+    }]
+
+    capm2 = None
+    if compare_two:
+        capm2 = capm_call(bench_value(benchmark_2))
+        rows.append({
+            "benchmark": capm2.get("benchmark"),
+            "alpha_annual": capm2.get("alpha_annual"),
+            "beta": capm2.get("beta"),
+            "r2": capm2.get("r2"),
+            "alpha_daily": (capm2.get("regression") or {}).get("alpha_daily"),
+            "rf_daily": (capm2.get("regression") or {}).get("rf_daily"),
+            "n_obs": (capm2.get("regression") or {}).get("n_obs"),
+        })
+
+    capm_table = pd.DataFrame(rows).set_index("benchmark")
+
+    st.markdown("### CAPM — Tabela (Excel-friendly)")
+    st.dataframe(capm_table.round(8), use_container_width=True)
+    download_df(capm_table.round(8), "capm_table")
+
+    # Scatter CAPM (benchmark principal)
+    st.markdown("### CAPM — Scatter (benchmark principal)")
+    sc = pd.DataFrame.from_dict(capm1.get("scatter", {}), orient="columns")
     if not sc.empty:
         try:
             sc.index = pd.to_datetime(sc.index)
@@ -386,7 +506,7 @@ if run:
             fig.add_trace(go.Scatter(x=sc["x"], y=sc["y"], mode="markers", name="Obs"))
             fig.add_trace(go.Scatter(x=sc["x"], y=sc["y_hat"], mode="lines", name="Linha CAPM"))
             fig.update_layout(
-                title="CAPM: Benchmark excess vs Portfolio excess",
+                title=f"CAPM: Benchmark excess vs Portfolio excess ({capm1.get('benchmark')})",
                 xaxis_title="Benchmark excess",
                 yaxis_title="Portfolio excess"
             )
