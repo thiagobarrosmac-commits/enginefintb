@@ -58,11 +58,11 @@ def show_table(df: pd.DataFrame, title: str, fmt: str = "{:.6f}"):
     st.table(df2.style.format(fmt))
 
 def download_df(df: pd.DataFrame, filename_base: str):
-    """Botões CSV + XLSX para Excel."""
+    """Botões CSV + XLSX para Excel. XLSX só se openpyxl estiver disponível."""
     if df is None or df.empty:
         return
 
-    # CSV
+    # CSV (sempre)
     csv_bytes = df.to_csv(index=True).encode("utf-8")
     st.download_button(
         label=f"⬇️ Baixar {filename_base}.csv",
@@ -71,16 +71,22 @@ def download_df(df: pd.DataFrame, filename_base: str):
         mime="text/csv",
     )
 
-    # XLSX
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="data", index=True)
-    st.download_button(
-        label=f"⬇️ Baixar {filename_base}.xlsx",
-        data=output.getvalue(),
-        file_name=f"{filename_base}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # XLSX (opcional)
+    try:
+        import openpyxl  # noqa: F401
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="data", index=True)
+
+        st.download_button(
+            label=f"⬇️ Baixar {filename_base}.xlsx",
+            data=output.getvalue(),
+            file_name=f"{filename_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception:
+        st.caption("ℹ️ XLSX indisponível (openpyxl não instalado). Use CSV ou adicione openpyxl ao requirements.txt.")
 
 # -----------------------------
 # Portfolio helpers (local)
@@ -400,6 +406,7 @@ if run:
         eq = mk.get("equal_weight", {})
         max_sh = mk.get("max_sharpe", {})
         min_v = mk.get("min_variance", {})
+        port_user_api = mk.get("port_user", {})  # ✅ novo (backend patch)
 
         fig = px.scatter(pts, x="vol", y="ret", hover_data=["sharpe"], title="Markowitz: Simulação + Envelope + PORT")
         if not env.empty and {"vol", "ret"}.issubset(env.columns):
@@ -409,8 +416,9 @@ if run:
         if "vol" in max_sh and "ret" in max_sh:
             fig.add_trace(go.Scatter(x=[max_sh["vol"]], y=[max_sh["ret"]], mode="markers", name="Max Sharpe"))
 
-        p_ret = float(port_stats["ret_annual"])
-        p_vol = float(port_stats["vol_annual"])
+        # PORT point — prioriza backend (port_user), fallback para local
+        p_ret = float(port_user_api.get("ret", port_stats["ret_annual"]))
+        p_vol = float(port_user_api.get("vol", port_stats["vol_annual"]))
         fig.add_trace(go.Scatter(x=[p_vol], y=[p_ret], mode="markers", name="PORT (seus pesos)"))
 
         st.plotly_chart(fig, use_container_width=True)
@@ -418,25 +426,30 @@ if run:
         # -----------------------------
         # MARKOWITZ -> TABELAS (Excel-friendly)
         # -----------------------------
-        def weights_row(dct, tickers_list):
-            w = (dct or {}).get("weights", {}) if isinstance(dct, dict) else {}
+        def weights_row_from_block(block, tickers_list):
+            w = (block or {}).get("weights", {}) if isinstance(block, dict) else {}
             return {t: float(w.get(t, 0.0)) for t in tickers_list}
 
+        # ✅ usa min_variance ret/sharpe do backend se existir
         markowitz_metrics = pd.DataFrame(
             [
                 {"strategy": "equal_weight", "ret": eq.get("ret"), "vol": eq.get("vol"), "sharpe": eq.get("sharpe")},
                 {"strategy": "max_sharpe", "ret": max_sh.get("ret"), "vol": max_sh.get("vol"), "sharpe": max_sh.get("sharpe")},
-                {"strategy": "min_variance", "ret": np.nan, "vol": min_v.get("vol"), "sharpe": np.nan},
-                {"strategy": "port_user", "ret": p_ret, "vol": p_vol, "sharpe": sharpe_from_annual(p_ret, p_vol, rf_annual=rf_annual)},
+                {"strategy": "min_variance", "ret": min_v.get("ret"), "vol": min_v.get("vol"), "sharpe": min_v.get("sharpe")},
+                {"strategy": "port_user", "ret": port_user_api.get("ret", p_ret), "vol": port_user_api.get("vol", p_vol), "sharpe": port_user_api.get("sharpe", sharpe_from_annual(p_ret, p_vol, rf_annual=rf_annual))},
             ]
         ).set_index("strategy")
 
+        # ordena colunas para evitar confusão no print
+        markowitz_metrics = markowitz_metrics[["ret", "vol", "sharpe"]]
+
+        # pesos: usa port_user do backend, fallback para pesos locais
         markowitz_weights = pd.DataFrame(
             {
-                "equal_weight": weights_row(eq, tickers),
-                "max_sharpe": weights_row(max_sh, tickers),
-                "min_variance": weights_row(min_v, tickers),
-                "port_user": {t: float(w_port[i]) for i, t in enumerate(tickers)},
+                "equal_weight": weights_row_from_block(eq, tickers),
+                "max_sharpe": weights_row_from_block(max_sh, tickers),
+                "min_variance": weights_row_from_block(min_v, tickers),
+                "port_user": weights_row_from_block(port_user_api, tickers) if port_user_api else {t: float(w_port[i]) for i, t in enumerate(tickers)},
             }
         ).T
         markowitz_weights.index.name = "strategy"
@@ -449,6 +462,10 @@ if run:
         st.markdown("### Markowitz — Pesos (por estratégia)")
         st.dataframe(markowitz_weights.round(6), use_container_width=True)
         download_df(markowitz_weights.round(6), "markowitz_weights")
+
+        # dica de debugging
+        if "port_user" not in mk:
+            st.warning("Seu backend ainda não está retornando 'port_user'. Atualize o serviço do Render com o patch do backend.")
 
     # -----------------------------
     # 5) CAPM do Portfólio (alpha, beta, R²) -> TABELAS
@@ -472,7 +489,6 @@ if run:
         "n_obs": (capm1.get("regression") or {}).get("n_obs"),
     }]
 
-    capm2 = None
     if compare_two:
         capm2 = capm_call(bench_value(benchmark_2))
         rows.append({
