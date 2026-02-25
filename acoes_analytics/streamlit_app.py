@@ -63,7 +63,7 @@ st.markdown("""
 # Header
 # =============================
 
-st.markdown("## 📊 QuantView")
+st.markdown("## 📊 Investment Engine TBMF")
 st.caption("Quantitative Portfolio Analytics & Risk Assessment")
 
 # =============================
