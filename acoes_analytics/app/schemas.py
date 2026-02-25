@@ -1,3 +1,9 @@
+"""
+QuantView — Pydantic Schemas
+==============================
+Modelos de request/response para a API FastAPI.
+"""
+
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
@@ -44,10 +50,7 @@ class MarkowitzResponse(BaseModel):
     equal_weight: Dict[str, Any]
     max_sharpe: Dict[str, Any]
     min_variance: Dict[str, Any]
-
-    # ✅ NOVO: estatísticas do PORT do usuário calculadas no backend
     port_user: Dict[str, Any]
-
     inputs: Dict[str, Any]
 
 
@@ -58,3 +61,13 @@ class CAPMResponse(BaseModel):
     r2: float
     regression: Dict[str, Any]
     scatter: Dict[str, Any]
+
+
+class VaRResponse(BaseModel):
+    var_95: Dict[str, Any]
+    var_99: Dict[str, Any]
+    stress_scenarios: List[Dict[str, Any]]
+
+
+class ValuationResponse(BaseModel):
+    multiples: Dict[str, Any]
