@@ -25,7 +25,7 @@ from datetime import date, timedelta
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 st.set_page_config(
-    page_title="Engine TBMF— Portfolio Analytics",
+    page_title="QuantView — Portfolio Analytics",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -63,7 +63,7 @@ st.markdown("""
 # Header
 # =============================
 
-st.markdown("## 📊 Investment Engine TBMF")
+st.markdown("## 📊 QuantView")
 st.caption("Quantitative Portfolio Analytics & Risk Assessment")
 
 # =============================
